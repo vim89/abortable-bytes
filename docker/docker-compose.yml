@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  fake-gcs-server:
+    image: fsouza/fake-gcs-server:latest
+    container_name: flowforge-fake-gcs
+    command: ["-scheme", "http"]  # run over HTTP to avoid TLS complexity in tests
+    ports:
+      - "4443:4443"
+    volumes:
+      # Preload a bucket named 'sample-gcs-bucket' by mounting data dir:
+      # Any file under docker/gcs-data/sample-gcs-bucket becomes an object.
+      - "./gcs-data:/data"
