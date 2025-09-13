@@ -36,21 +36,18 @@ object Main extends IOApp:
     CatsIO.println(
       s"""
          |Usage:
-         |  runMain vim.poc.Main s3  s3://<bucket>/<key>  /path/to/file  [--cancel-after-ms 1000]
          |  runMain vim.poc.Main gcs gs://<bucket>/<key>  /path/to/file  [--cancel-after-ms 1000]
          |
          |Env knobs:
-         |  READ_CHUNK_KB   (default 128)  - fs2 read chunk size
-         |  GCS_CHUNK_MB    (default 8)    - GCS WriteChannel chunk size
-         |  GCS_THROTTLE_MS_PER_CHUNK      - Add small delays per chunk e.g.; GCS_THROTTLE_MS_PER_CHUNK=150
-         |                                   Expected: no object (since only completed resumables appear).
-         |                                   If you still see it, your cancel happened after finalize;
-         |                                   increase --cancel-after-ms gap and/or throttle more.
-         |                                   https://cloud.google.com/storage/docs/resumable-uploads
-         |
+         |  READ_CHUNK_KB             (default 128)     - fs2 read chunk size
+         |  GCS_CHUNK_MB                (default 8)     - GCS WriteChannel chunk size
+         |  GCS_THROTTLE_MS_PER_CHUNK   (default 8)     - Add small delays per chunk e.g.; GCS_THROTTLE_MS_PER_CHUNK=150
+         |                                                Expected: no object (since only completed resumables appear).
+         |                                                If you still see it, your cancel happened after finalize;
+         |                                                increase --cancel-after-ms gap and/or throttle more.
+         |                                                https://cloud.google.com/storage/docs/resumable-uploads
          |Prereqs:
          |  docker compose -f docker/docker-compose.yml up -d
-         |  bash docker/init-localstack-s3.sh <bucket>
          |""".stripMargin
     )
 
