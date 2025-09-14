@@ -1,35 +1,35 @@
 package vim.poc.gcs
 
-import com.google.cloud.{NoCredentials, WriteChannel}
-import kyo.<
-import vim.poc.{CloudUploadSink, CloudUri, KyoInterOp, UploadResult}
 import cats.arrow.FunctionK
 import cats.effect.IO as CatsIO
 import cats.effect.kernel.{Outcome, Async as CEAsync}
 import cats.effect.std.Dispatcher
-import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
 import fs2.Stream
+import kyo.{<, Env}
 import com.google.auth.Credentials
+import com.google.cloud.{NoCredentials, WriteChannel}
 import com.google.cloud.storage.{BlobId, BlobInfo, Storage, StorageException, StorageOptions}
+import vim.poc.{CloudUploadSink, CloudUri, KyoInterOp, UploadResult}
 
 import java.io.*
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicReference
 
-/** Resumable GCS upload using WriteChannel.capture/restore with FS2 + Kyo interop.
-  *
-  * Generic in `F`: accepts `Stream[F, Byte]` and returns `F[UploadResult]`. Requires a Cats Effect `Async[F]`.
+/** Resumable GCS upload sink using `WriteChannel.capture/restore`. Generic in `F` for the public API, translating
+  * `Stream[F, *]` to `Stream[IO, *]` at the boundary with a `Dispatcher`, then converting the final `IO` back to `F`.
+  *   - uses `KyoInterOp.FX` (the canonical effect set) for the Kyo program, and
+  *   - obtains request-scoped `UploadCtx` via `Env.get[UploadCtx]`, passing it in with `KyoInterOp.run(ctx)(program)`.
   */
-final class GcsUploadSink[F[_]](storage: Storage, chunkSize: Int = 8 * 1024 * 1024)(using
-    CEAsync[F]
-) extends CloudUploadSink[F]:
+final class GcsUploadSink[F[_]](storage: Storage, chunkSize: Int = 8 * 1024 * 1024)(using CEAsync[F])
+    extends CloudUploadSink[F] {
 
-  // capture/restore kept in-memory for demo (persist externally if you want crash-resume across processes)
+  // capture/restore kept in-memory for demo (persist externally to survive process restarts)
   private final case class Capture(bytes: Array[Byte])
+
   private val captureRef = new AtomicReference[Option[Capture]](None)
 
-  // low-level blocking helpers in CatsIO (keeps SDK blocking off F’s compute pool)
+  // Low-level blocking helpers in IO
   private def newWriter(blobInfo: BlobInfo): CatsIO[WriteChannel] =
     CatsIO.blocking {
       val w = storage.writer(blobInfo) // resumable for large payloads
@@ -55,22 +55,20 @@ final class GcsUploadSink[F[_]](storage: Storage, chunkSize: Int = 8 * 1024 * 10
       captureRef.set(Some(Capture(baos.toByteArray)))
     }
 
+  private def writeChunk(w: WriteChannel, arr: Array[Byte]): CatsIO[Int] =
+    // interruptible so cancellation can preempt mid-call if the channel honors interruption
+    CatsIO.interruptibleMany(w.write(ByteBuffer.wrap(arr)))
+
   private def closeWriter(w: WriteChannel): CatsIO[Unit] =
     CatsIO.interruptibleMany(w.close())
 
-  private def writeChunk(w: WriteChannel, arr: Array[Byte]): CatsIO[Int] =
-    // CatsIO.blocking(w.write(ByteBuffer.wrap(arr)))
-    // attempts to cancel using Thread.interrupt if the fiber is canceled mid-write
-    CatsIO.interruptibleMany(w.write(ByteBuffer.wrap(arr)))
+  private def isRetryable(t: Throwable): Boolean = t match
+    case e: StorageException =>
+      val c = e.getCode
+      c == 408 || c == 429 || (c >= 500 && c < 600)
+    case _ => false
 
-  private def isRetryable(t: Throwable): Boolean =
-    t match
-      case e: StorageException =>
-        val c = e.getCode
-        c == 408 || c == 429 || (c >= 500 && c < 600) // typical transient codes
-      case _ => false
-
-  /** Upload a byte stream to gs://bucket/key; returns exact bytes (generation/etag not exposed on close). */
+  /** Public API Upload a byte stream to gs://bucket/key; returns exact bytes (generation/etag not exposed on close). */
   def upload(bytes: Stream[F, Byte], dest: CloudUri): F[UploadResult] =
     val blobId   = BlobId.of(dest.bucket, dest.key)
     val blobInfo = BlobInfo.newBuilder(blobId).build()
@@ -79,60 +77,76 @@ final class GcsUploadSink[F[_]](storage: Storage, chunkSize: Int = 8 * 1024 * 10
     Dispatcher.parallel[F].use { dispatcher =>
       // F ~> IO (safe) using Dispatcher’s unsafeToFuture wrapped in IO.fromFuture
       val toIO: FunctionK[F, CatsIO] = new FunctionK[F, CatsIO]:
-        def apply[A](fa: F[A]): CatsIO[A] =
-          CatsIO.fromFuture(CatsIO(dispatcher.unsafeToFuture(fa)))
+        def apply[A](fa: F[A]): CatsIO[A] = CatsIO.fromFuture(CatsIO(dispatcher.unsafeToFuture(fa)))
 
       val bytesIO: Stream[CatsIO, Byte] = bytes.translate(toIO)
 
-      // Core program in Kyo (effect set bridged via KyoInterop.get/run)
-      val program: UploadResult < KyoInterOp.BaseFX =
-        KyoInterOp.get {
-          def writeWithRetry(cur: WriteChannel, arr: Array[Byte], attempt: Int = 0): CatsIO[(WriteChannel, Int)] =
-            writeChunk(cur, arr).attempt.flatMap {
-              case Right(n) =>
-                CatsIO.pure((cur, n))
-              case Left(e) if isRetryable(e) && attempt < 3 =>
-                val nextWriterIO =
-                  captureRef.get() match
-                    case Some(cap) => restoreWriter(cap)
-                    case None      => newWriter(blobInfo)
-                nextWriterIO.flatMap(nw => writeWithRetry(nw, arr, attempt + 1))
-              case Left(e) =>
-                CatsIO.raiseError(e)
-            }
+      // Provide request-scoped context to the Kyo program
+      val ctx = KyoInterOp.UploadCtx(
+        traceId = java.util.UUID.randomUUID().toString,
+        auditId = s"${dest.bucket}/${dest.key}"
+      )
 
-          for
-            w0 <- newWriter(blobInfo)
+      // Kyo program with the canonical effect set `FX` and `UploadCtx` in Env
+      val program: UploadResult < KyoInterOp.FX =
+        for
+          ctxEff <- Env.get[KyoInterOp.UploadCtx]
+          _ <- KyoInterOp
+            .get(CatsIO.println(s"[trace=${ctxEff.traceId}] GCS upload start -> ${dest.bucket}/${dest.key}"))
 
-            // Keep (writer,total) as state; emit the same so we can grab the last element easily.
-            lastState <- bytesIO
+          // acquire writer
+          w0 <- KyoInterOp.get(newWriter(blobInfo))
+
+          // process the stream in IO, lifted into the Kyo program
+          lastState <- KyoInterOp.get {
+            bytesIO
               .chunkN(chunkSize, allowFewer = true)
               .evalMapAccumulate((w0, 0L)) { case ((w, total), chunk) =>
                 val arr = chunk.toArray
-                for
-                  (w2, written) <- writeWithRetry(w, arr)
-                  nextTotal = total + written.toLong
-                  _ <- if ((nextTotal / chunkSize) % 16 == 0) captureWriter(w2) else CatsIO.unit
-                yield ((w2, nextTotal), (w2, nextTotal)) // (newState, emittedValue)
+                writeChunk(w, arr).attempt.flatMap {
+                  case Right(n) =>
+                    val nextTotal = total + n.toLong
+                    val doCapture = (nextTotal / chunkSize) % 16 == 0
+                    val cap       = if doCapture then captureWriter(w) else CatsIO.unit
+                    cap.as(((w, nextTotal), (w, nextTotal)))
+                  case Left(e) if isRetryable(e) =>
+                    val nextW = captureRef.get() match
+                      case Some(cap) => restoreWriter(cap)
+                      case None      => newWriter(blobInfo)
+                    nextW.map(nw => ((nw, total), (nw, total)))
+                  case Left(e) => CatsIO.raiseError(e)
+                }
               }
               .map(_._2) // stream of (writer,total)
               .compile
-              .lastOrError // final (writer,total)
+              .lastOrError
+          }
 
-            (wLast, totalBytes) = lastState
-            _ <- CatsIO.interruptibleMany(wLast.close()) // finalize upload (interruptible)
-          yield UploadResult(bytes = totalBytes, etag = None, generation = None)
-        }
+          // finalize (interruptible)
+          _ <- KyoInterOp.get {
+            val (wLast, _) = lastState
+            closeWriter(wLast)
+          }
 
-      val ioResult: CatsIO[UploadResult] = {
-        KyoInterOp.run(program).guaranteeCase {
-          case Outcome.Canceled() => CatsIO.unit // on cancel, don't close writer -> upload not finalized
+          // return result
+          res <- KyoInterOp.get {
+            val (_, totalBytes) = lastState
+            CatsIO.pure(UploadResult(bytes = totalBytes, etag = None, generation = None))
+          }
+        yield res
+
+      val ioResult: CatsIO[UploadResult] =
+        KyoInterOp.run(ctx)(program).guaranteeCase {
+          case Outcome.Canceled() => CatsIO.unit // on cancel, don't close writer → upload not finalized
           case _                  => CatsIO.unit
         }
-      }
 
+      // IO -> F using the same Dispatcher (no implicit IORuntime required)
+      implicit val runtime = cats.effect.unsafe.IORuntime.global // Or a custom one
       CEAsync[F].fromFuture(CEAsync[F].delay(ioResult.unsafeToFuture()))
     }
+
+}
 
 object GcsUploadSink:
   /** fake-gcs-server client (HTTP, no credentials), good for local/integration tests. */
