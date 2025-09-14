@@ -19,14 +19,13 @@ import java.util.concurrent.atomic.AtomicReference
 
 /** Resumable GCS upload using WriteChannel.capture/restore with FS2 + Kyo interop.
   *
-  * Generic in `F`: accepts `Stream[F, Byte]` and returns `F[UploadResult]`. Requires a Cats Effect `Async[F]` (no
-  * LiftIO needed).
+  * Generic in `F`: accepts `Stream[F, Byte]` and returns `F[UploadResult]`. Requires a Cats Effect `Async[F]`.
   */
 final class GcsUploadSink[F[_]](storage: Storage, chunkSize: Int = 8 * 1024 * 1024)(using
     CEAsync[F]
 ) extends CloudUploadSink[F]:
 
-  // ---- capture/restore kept in-memory for demo (persist externally if you want crash-resume across processes)
+  // capture/restore kept in-memory for demo (persist externally if you want crash-resume across processes)
   private final case class Capture(bytes: Array[Byte])
   private val captureRef = new AtomicReference[Option[Capture]](None)
 
@@ -76,7 +75,7 @@ final class GcsUploadSink[F[_]](storage: Storage, chunkSize: Int = 8 * 1024 * 10
     val blobId   = BlobId.of(dest.bucket, dest.key)
     val blobInfo = BlobInfo.newBuilder(blobId).build()
 
-    // Use a Dispatcher to (1) translate Stream[F, *] -> Stream[IO, *] and (2) convert IO back to F without LiftIO
+    // Use a Dispatcher to (1) translate Stream[F, *] -> Stream[IO, *] and (2) convert IO back to F
     Dispatcher.parallel[F].use { dispatcher =>
       // F ~> IO (safe) using Dispatcher’s unsafeToFuture wrapped in IO.fromFuture
       val toIO: FunctionK[F, CatsIO] = new FunctionK[F, CatsIO]:
@@ -127,7 +126,7 @@ final class GcsUploadSink[F[_]](storage: Storage, chunkSize: Int = 8 * 1024 * 10
 
       val ioResult: CatsIO[UploadResult] = {
         KyoInterOp.run(program).guaranteeCase {
-          case Outcome.Canceled() => CatsIO.unit // on cancel, don't close writer → upload not finalized
+          case Outcome.Canceled() => CatsIO.unit // on cancel, don't close writer -> upload not finalized
           case _                  => CatsIO.unit
         }
       }
